@@ -118,8 +118,10 @@ TRACKPOINT_CONF="${XORG_CONF_PATH}/80-${UMPC}-trackpoint.conf"
 TOUCH_RULES="${SQUASH_OUT}/etc/udev/rules.d/99-${UMPC}-touch.rules"
 GRUB_DEFAULT_CONF="${SQUASH_OUT}/etc/default/grub"
 GRUB_D_CONF="${SQUASH_OUT}/etc/default/grub.d/${UMPC}.cfg"
+# GRUB_BOOT_CONF points to the config within the *copied* ISO structure, not the extracted filesystem
 GRUB_BOOT_CONF="${MNT_OUT}/boot/grub/grub.cfg"
-GRUB_LOOPBACK_CONF="${MNT_OUT}/boot/grub/loopback.cfg"
+# GRUB_LOOPBACK_CONF is less relevant/stable in newer ISOs, modifications removed later
+# GRUB_LOOPBACK_CONF="${MNT_OUT}/boot/grub/loopback.cfg"
 CONSOLE_CONF="${SQUASH_OUT}/etc/default/console-setup"
 GSCHEMA_OVERRIDE="${SQUASH_OUT}/usr/share/glib-2.0/schemas/90-${UMPC}.gschema.override"
 HWDB_CONF="${SQUASH_OUT}/etc/udev/hwdb.d/61-${UMPC}-sensor-local.hwdb"
@@ -148,12 +150,11 @@ else
   fi
 fi
 
-if [ -f "${MNT_IN}/.disk/info" ] && [ -f "${MNT_IN}/casper/filesystem.squashfs" ]; then
-  FLAVOUR=$(cut -d' ' -f1 < "${MNT_IN}/.disk/info")
-  VERSION=$(cut -d' ' -f2 < "${MNT_IN}/.disk/info")
-  CODENAME=$(cut -d'"' -f2 < "${MNT_IN}/.disk/info")
-  echo "Modifying ${FLAVOUR} ${VERSION} (${CODENAME}) for the ${UMPC}"
+# Validate ISO structure - check for key files common in recent Ubuntu releases
+if [ -f "${MNT_IN}/casper/filesystem.squashfs" ] && [ -f "${MNT_IN}/boot/grub/grub.cfg" ]; then
+  echo "Detected potential Ubuntu ISO structure. Proceeding with extraction..."
 
+  # Copy ISO contents excluding the main filesystem
   rsync -aHAXx --delete --quiet \
     --exclude=/casper/filesystem.squashfs \
     --exclude=/casper/filesystem.squashfs.gpg \
@@ -161,24 +162,60 @@ if [ -f "${MNT_IN}/.disk/info" ] && [ -f "${MNT_IN}/casper/filesystem.squashfs" 
     "${MNT_IN}/" "${MNT_OUT}/" 2>&1 >/dev/null
 
   # Extract the contents of the squashfs
+  echo "Extracting ${SQUASH_IN} to ${SQUASH_OUT}..."
   unsquashfs -f -d "${SQUASH_OUT}" "${SQUASH_IN}"
+  if [ $? -ne 0 ]; then
+    echo "ERROR! Failed to extract ${SQUASH_IN}"
+    umount -l "${MNT_IN}" 2>/dev/null
+    clean_up
+    exit 1
+  fi
+
+  # Now determine Flavour, Version, Codename from the extracted filesystem
+  LSB_RELEASE_FILE="${SQUASH_OUT}/etc/lsb-release"
+  if [ -f "${LSB_RELEASE_FILE}" ]; then
+    # Source the lsb-release file in a subshell to avoid polluting the main script's environment
+    (
+      source "${LSB_RELEASE_FILE}"
+      FLAVOUR="${DISTRIB_ID:-Unknown}"
+      VERSION="${DISTRIB_RELEASE:-Unknown}"
+      CODENAME="${DISTRIB_CODENAME:-Unknown}"
+      echo "Modifying ${FLAVOUR} ${VERSION} (${CODENAME}) for the ${UMPC}"
+    )
+    # Re-source into the main script to get the variables
+    source "${LSB_RELEASE_FILE}"
+  else
+    echo "WARNING! Could not find ${LSB_RELEASE_FILE} in extracted filesystem. Cannot determine Ubuntu version accurately."
+    FLAVOUR="Unknown"
+    VERSION="Unknown"
+    CODENAME="Unknown"
+  fi
+
   umount -l "${MNT_IN}"
 else
-  echo "ERROR! This doesn't look like an Ubuntu iso image."
+  echo "ERROR! This doesn't look like a supported Ubuntu/Debian live iso image."
+  echo "Expected to find '${MNT_IN}/casper/filesystem.squashfs' and '${MNT_IN}/boot/grub/grub.cfg'."
   umount -l "${MNT_IN}"
   clean_up
   exit 1
 fi
 
-# Check versions
+# Check versions - Allow 20.04+
 case ${VERSION} in
   14*|16*|18*)
-    echo "ERROR! Only Ubuntu 20.04 or newer is supported."
+    echo "ERROR! Only Ubuntu 20.04 or newer is supported. Detected: ${VERSION}"
+    clean_up
     exit 1
+    ;;
+  Unknown)
+    echo "WARNING! Could not determine Ubuntu version. Proceeding with caution."
+    ;;
+  *)
+    echo "Detected Ubuntu version: ${VERSION}"
     ;;
 esac
 
-# Some device have require specific Ubuntu releases.
+# Some devices require specific Ubuntu releases.
 case "${UMPC}" in
   gpd-pocket3)
     case ${VERSION} in
@@ -189,11 +226,22 @@ case "${UMPC}" in
     esac
     ;;
   gpd-win-max)
+    # GPD Win Max specific version handling needs update for 24.04+
     case ${VERSION} in
-      22.04*)
+      22.04*|23*|24*)
+        # Use the standard cfg for newer releases, EDID injection likely not needed/harmful
+        GRUB_D_CONF="${SQUASH_OUT}/etc/default/grub.d/${UMPC}.cfg"
+        echo "INFO: Using standard GRUB config for GPD Win Max on Ubuntu ${VERSION}."
+        ;;
+      20*|21*)
+        # Keep original logic for older releases requiring specific EDID/cfg
         GRUB_D_CONF="${SQUASH_OUT}/etc/default/grub.d/${UMPC}-new.cfg"
-        echo "ERROR! GPD Win Max is only supported by Ubuntu 20.04 to 21.10."
-        exit 1
+        echo "INFO: Using legacy GRUB config for GPD Win Max on Ubuntu ${VERSION}."
+        ;;
+      *)
+        # Default for unknown or other versions
+        GRUB_D_CONF="${SQUASH_OUT}/etc/default/grub.d/${UMPC}.cfg"
+        echo "WARNING: Unknown Ubuntu version (${VERSION}) for GPD Win Max. Using standard GRUB config."
         ;;
     esac
     ;;
@@ -229,9 +277,9 @@ case ${UMPC} in
     inject_data "${SQUASH_OUT}/lib/firmware/brcm/brcmfmac4356-pcie.txt"
 
     # Frame buffer rotation
-    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1/' "${GRUB_DEFAULT_CONF}"
+    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 /' "${GRUB_DEFAULT_CONF}"
     sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_BOOT_CONF}"
-    sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}"
+    # sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
 
     # Increase console font size
     sed -i 's/FONTSIZE="8x16"/FONTSIZE="16x32"/' "${CONSOLE_CONF}"
@@ -243,9 +291,9 @@ case ${UMPC} in
     ;;
   gpd-pocket2)
     # Frame buffer rotation
-    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1/' "${GRUB_DEFAULT_CONF}"
+    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 /' "${GRUB_DEFAULT_CONF}"
     sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_BOOT_CONF}"
-    sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}"
+    # sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
 
     # Increase console font size
     sed -i 's/FONTSIZE="8x16"/FONTSIZE="16x32"/' "${CONSOLE_CONF}"
@@ -262,9 +310,9 @@ case ${UMPC} in
     #  - This issue also affects suspend feature.
     #  - Patches are being worked on, more info here:
     #    https://ubuntu-mate.community/t/gpd-pocket-3-s3-sleep-waiting-for-kernel-fix/25053/
-    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle/' "${GRUB_DEFAULT_CONF}"
+    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle /' "${GRUB_DEFAULT_CONF}"
     sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_BOOT_CONF}"
-    sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}"
+    # sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
 
     # Increase console font size
     sed -i 's/FONTSIZE="8x16"/FONTSIZE="16x32"/' "${CONSOLE_CONF}"
@@ -285,16 +333,16 @@ case ${UMPC} in
     ;;
   gpd-micropc)
     # Frame buffer rotation
-    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1/' "${GRUB_DEFAULT_CONF}"
+    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 /' "${GRUB_DEFAULT_CONF}"
     sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_BOOT_CONF}"
-    sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}"
+    # sed -i 's/quiet splash/fbcon=rotate:1 fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
     ;;
   gpd-win2)
     # Frame buffer rotation
     # s2idle is required to wake from suspend.
-    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 video=eDP-1:panel_orientation=right_side_up mem_sleep_default=s2idle/' "${GRUB_DEFAULT_CONF}"
+    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 video=eDP-1:panel_orientation=right_side_up mem_sleep_default=s2idle /' "${GRUB_DEFAULT_CONF}"
     sed -i 's/quiet splash/fbcon=rotate:1 video=eDP-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_BOOT_CONF}"
-    sed -i 's/quiet splash/fbcon=rotate:1 video=eDP-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}"
+    # sed -i 's/quiet splash/fbcon=rotate:1 video=eDP-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
     ;;
   gpd-win3)
     # Frame buffer rotation and s2idle by default.
@@ -303,9 +351,9 @@ case ${UMPC} in
     #  - This issue also affects suspend feature.
     #  - Patches are being worked on, more info here:
     #    https://ubuntu-mate.community/t/gpd-pocket-3-s3-sleep-waiting-for-kernel-fix/25053/
-    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle/' "${GRUB_DEFAULT_CONF}"
+    sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle /' "${GRUB_DEFAULT_CONF}"
     sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_BOOT_CONF}"
-    sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}"
+    # sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up mem_sleep_default=s2idle fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
 
     # Might need a workaround for the touch screen.
     # > "My touch screen does work if I "modprobe -r goodix && modprobe goodix"
@@ -313,19 +361,22 @@ case ${UMPC} in
     # See also: https://aur.archlinux.org/packages/goodix-gpdwin3-dkms/
     ;;
   gpd-win-max)
-    # Add device specific EDID on Ubuntu 21.10 are earlier
+    # Add device specific EDID only on older Ubuntu versions (pre-22.04)
     # https://patchwork.kernel.org/project/intel-gfx/cover/20210817204329.5457-1-anisse@astier.eu/#24416791
     case "${VERSION}" in
-      22*)
-        sed -i "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"fbcon=rotate:1 video=eDP-1:800x1280/" "${GRUB_DEFAULT_CONF}"
-        sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 fsck.mode=skip quiet splash/g" "${GRUB_BOOT_CONF}"
-        sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 fsck.mode=skip quiet splash/g" "${GRUB_LOOPBACK_CONF}"
+      20*|21*)
+        echo "INFO: Applying GPD Win Max EDID workaround for Ubuntu ${VERSION}."
+        inject_data "${SQUASH_OUT}/usr/lib/firmware/edid/${UMPC}-edid.bin"
+        sed -i "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"fbcon=rotate:1 video=eDP-1:800x1280 drm.edid_firmware=eDP-1:edid\/${UMPC}-edid.bin /" "${GRUB_DEFAULT_CONF}"
+        sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 drm.edid_firmware=eDP-1:edid\/${UMPC}-edid.bin fsck.mode=skip quiet splash/g" "${GRUB_BOOT_CONF}"
+        # sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 drm.edid_firmware=eDP-1:edid\/${UMPC}-edid.bin fsck.mode=skip quiet splash/g" "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
         ;;
       *)
-        inject_data "${SQUASH_OUT}/usr/lib/firmware/edid/${UMPC}-edid.bin"
-        sed -i "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"fbcon=rotate:1 video=eDP-1:800x1280 drm.edid_firmware=eDP-1:edid\/${UMPC}-edid.bin/" "${GRUB_DEFAULT_CONF}"
-        sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 drm.edid_firmware=eDP-1:edid\/${UMPC}-edid.bin fsck.mode=skip quiet splash/g" "${GRUB_BOOT_CONF}"
-        sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 drm.edid_firmware=eDP-1:edid\/${UMPC}-edid.bin fsck.mode=skip quiet splash/g" "${GRUB_LOOPBACK_CONF}"
+        # For 22.04 and newer, EDID should be handled by kernel, just set rotation and resolution
+        echo "INFO: Applying standard GPD Win Max GRUB settings for Ubuntu ${VERSION}."
+        sed -i "s/GRUB_CMDLINE_LINUX=\"/GRUB_CMDLINE_LINUX=\"fbcon=rotate:1 video=eDP-1:800x1280 /" "${GRUB_DEFAULT_CONF}"
+        sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 fsck.mode=skip quiet splash/g" "${GRUB_BOOT_CONF}"
+        # sed -i "s/quiet splash/fbcon=rotate:1 video=eDP-1:800x1280 fsck.mode=skip quiet splash/g" "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
         ;;
     esac
     ;;
@@ -333,7 +384,7 @@ case ${UMPC} in
     # Frame buffer rotation
     sed -i 's/GRUB_CMDLINE_LINUX="/GRUB_CMDLINE_LINUX="fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up /' "${GRUB_DEFAULT_CONF}"
     sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up fsck.mode=skip quiet splash/g' "${GRUB_BOOT_CONF}"
-    sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}"
+    # sed -i 's/quiet splash/fbcon=rotate:1 video=DSI-1:panel_orientation=right_side_up fsck.mode=skip quiet splash/g' "${GRUB_LOOPBACK_CONF}" # loopback.cfg modifications removed
 
     # Increase console font size
     sed -i 's/FONTSIZE="8x16"/FONTSIZE="16x32"/' "${CONSOLE_CONF}"
@@ -366,7 +417,7 @@ esac
 
 #echo
 #echo "Modified : ${GRUB_LOOPBACK_CONF}"
-#cat "${GRUB_LOOPBACK_CONF}"
+#cat "${GRUB_BOOT_CONF}"
 #echo
 
 # Update filesystem size
