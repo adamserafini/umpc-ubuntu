@@ -154,22 +154,29 @@ fi
 if [ -d "${MNT_IN}/casper" ] && [ -f "${MNT_IN}/boot/grub/grub.cfg" ]; then
   echo "Detected potential Ubuntu ISO structure. Proceeding..."
 
-  # Check if the target squashfs file exists
-  if [ ! -f "${SQUASH_IN}" ]; then
-    echo "ERROR! Expected squashfs file not found: ${SQUASH_IN}"
-    echo "Please check the ISO structure. Found files in ${MNT_IN}/casper:"
+  # Dynamically locate the squashfs filesystem image (Ubuntu ≥23.10 renamed it)
+  POSSIBLE_SQUASHFS=("filesystem.squashfs" "minimal.squashfs" "minimal.standard.live.squashfs" "minimal.standard.squashfs")
+  SQUASH_IN=""
+  for img in "${POSSIBLE_SQUASHFS[@]}"; do
+    if [ -f "${MNT_IN}/casper/${img}" ]; then
+      SQUASH_IN="${MNT_IN}/casper/${img}"
+      SQUASH_TARGET_NAME="${img}"
+      break
+    fi
+  done
+
+  if [ -z "${SQUASH_IN}" ]; then
+    echo "ERROR! No squashfs filesystem image found in ${MNT_IN}/casper"
     ls -l "${MNT_IN}/casper"
     umount -l "${MNT_IN}" 2>/dev/null
     clean_up
     exit 1
   fi
-  echo "Found target filesystem: ${SQUASH_IN}"
+  echo "Using squashfs image: ${SQUASH_TARGET_NAME}"
 
   # Copy ISO contents excluding the minimal squashfs files and md5sum
   echo "Copying ISO structure to ${MNT_OUT}..."
   rsync -aHAXx --delete --quiet \
-    --exclude=/casper/minimal.*.squashfs \
-    --exclude=/casper/minimal.*.squashfs.gpg \
     --exclude=/md5sum.txt \
     "${MNT_IN}/" "${MNT_OUT}/" 2>&1 >/dev/null
 
