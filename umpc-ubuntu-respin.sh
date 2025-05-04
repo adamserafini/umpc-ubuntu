@@ -150,14 +150,26 @@ else
   fi
 fi
 
-# Validate ISO structure - check for key files common in recent Ubuntu releases
-if [ -f "${MNT_IN}/casper/filesystem.squashfs" ] && [ -f "${MNT_IN}/boot/grub/grub.cfg" ]; then
-  echo "Detected potential Ubuntu ISO structure. Proceeding with extraction..."
+# Validate ISO structure - check for /casper dir and grub.cfg (more robust for newer ISOs)
+if [ -d "${MNT_IN}/casper" ] && [ -f "${MNT_IN}/boot/grub/grub.cfg" ]; then
+  echo "Detected potential Ubuntu ISO structure. Proceeding..."
 
-  # Copy ISO contents excluding the main filesystem
+  # Check if the target squashfs file exists
+  if [ ! -f "${SQUASH_IN}" ]; then
+    echo "ERROR! Expected squashfs file not found: ${SQUASH_IN}"
+    echo "Please check the ISO structure. Found files in ${MNT_IN}/casper:"
+    ls -l "${MNT_IN}/casper"
+    umount -l "${MNT_IN}" 2>/dev/null
+    clean_up
+    exit 1
+  fi
+  echo "Found target filesystem: ${SQUASH_IN}"
+
+  # Copy ISO contents excluding the minimal squashfs files and md5sum
+  echo "Copying ISO structure to ${MNT_OUT}..."
   rsync -aHAXx --delete --quiet \
-    --exclude=/casper/filesystem.squashfs \
-    --exclude=/casper/filesystem.squashfs.gpg \
+    --exclude=/casper/minimal.*.squashfs \
+    --exclude=/casper/minimal.*.squashfs.gpg \
     --exclude=/md5sum.txt \
     "${MNT_IN}/" "${MNT_OUT}/" 2>&1 >/dev/null
 
@@ -420,13 +432,22 @@ esac
 #cat "${GRUB_BOOT_CONF}"
 #echo
 
-# Update filesystem size
+# Update filesystem size - Note: This size file might not be used by newer installers, but doesn't hurt to create.
 du -sx --block-size=1 "${SQUASH_OUT}" | cut -f1 > "${MNT_OUT}/casper/filesystem.size"
 
-# Repack squahsfs
-rm -f "${MNT_OUT}/casper/filesystem.squashfs" 2>/dev/null
-mksquashfs "${SQUASH_OUT}" "${MNT_OUT}/casper/filesystem.squashfs"
-echo "Cleaning up..."
+# Repack squashfs using the original target name
+SQUASH_OUT_FILE="${MNT_OUT}/casper/${SQUASH_TARGET_NAME}"
+echo "Repacking filesystem to ${SQUASH_OUT_FILE}..."
+rm -f "${SQUASH_OUT_FILE}" 2>/dev/null
+mksquashfs "${SQUASH_OUT}" "${SQUASH_OUT_FILE}"
+if [ $? -ne 0 ]; then
+  echo "ERROR! Failed to repack squashfs."
+  # No cleanup here, might want to inspect MNT_OUT
+  exit 1
+fi
+echo "Repacking successful."
+
+echo "Cleaning up temporary filesystem..."
 echo "  - ${SQUASH_OUT}"
 rm -rf "${SQUASH_OUT}"
 sync
